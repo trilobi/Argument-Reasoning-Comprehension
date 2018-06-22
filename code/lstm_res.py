@@ -27,6 +27,7 @@ class Model(object):
 		
 		self.input_keep_prob = tf.placeholder(tf.float32, name='rnn_input_keep_prob')
 		self.output_keep_prob = tf.placeholder(tf.float32, name='rnn_output_keep_prob')
+		self.keep_prob = tf.placeholder(tf.float32, name='dnn_keep_prob')
 		
 		#----------------Target data------------------
 		self.warrant0 = tf.placeholder(tf.int32, [None, max_len], name='warrant0')
@@ -51,9 +52,6 @@ class Model(object):
 				cell = tf.nn.rnn_cell.DropoutWrapper(tf.nn.rnn_cell.BasicLSTMCell(lstm_num_units, state_is_tuple=True),
 																 input_keep_prob=self.input_keep_prob,
 																 output_keep_prob=self.output_keep_prob)	
-				#cell = tf.nn.rnn_cell.DropoutWrapper(tf.nn.rnn_cell.GRUCell(lstm_num_units),
-				#												 input_keep_prob=self.input_keep_prob,
-				#												 output_keep_prob=self.output_keep_prob)
 				outputs, state = tf.nn.dynamic_rnn(cell,
 												   sen_embedding, 
 												   sequence_length=sen_len,
@@ -98,36 +96,44 @@ class Model(object):
 			reason_outputs = lstm_layer(reason_embedded, self.reason_len)
 		with tf.variable_scope('lstm1_layer', reuse=True):
 			claim_outputs = lstm_layer(claim_embedded, self.claim_len)
-			claim_last_outputs = self.get_last(claim_outputs, self.claim_len)
 		
-		claim_meanpooling = tf.reduce_mean(claim_outputs, 1)
 		claim_maxpooling = tf.reduce_max(claim_outputs, 1)
 		alpha = tf.nn.softmax(tf.transpose(tf.matmul(reason_outputs, 
 										   tf.expand_dims(claim_maxpooling, -1)), [0,2,1]))
-		#context = tf.reduce_mean(tf.matmul(alpha, reason_outputs), 1)
+		context = tf.reduce_mean(tf.matmul(alpha, reason_outputs), 1)
 		
-		context = attention(reason_outputs, claim_maxpooling, max_len, lstm_num_units)
+		#context = attention(reason_outputs, claim_maxpooling, max_len, lstm_num_units)
 
-		with tf.variable_scope('lstm2_layer'):
+		with tf.variable_scope('lstm1_layer', reuse=True):
 			warrant0_outputs = lstm_layer(warrant0_embedded, self.warrant0_len)
 			warrant0 = tf.reduce_max(warrant0_outputs, 1)
-			#warrant0 = self.get_last(warrant0_outputs, self.warrant0_len)
-		with tf.variable_scope('lstm2_layer', reuse=True):
+		with tf.variable_scope('lstm1_layer', reuse=True):
 			warrant1_outputs = lstm_layer(warrant1_embedded, self.warrant1_len)
 			warrant1 = tf.reduce_max(warrant1_outputs, 1)
-			#warrant1 = self.get_last(warrant1_outputs, self.warrant1_len)
 		
+		def add_layer(inputs, in_size, out_size, activation_function=None):
+			W = tf.Variable(tf.truncated_normal((in_size, out_size), stddev=0.1))
+			b = tf.Variable(tf.constant(0.1, shape=[out_size]))
+			Wx_plus_b = tf.nn.xw_plus_b(inputs, W, b)
+			out = tf.nn.dropout(Wx_plus_b, keep_prob)
+			if activation_function is None:
+				outputs = out
+			else:
+				outputs = activation_function(out)
+			return outputs	
+	
+		with tf.variable_scope('DNN1_layer'):
+			Context = tf.nn.relu(add_layer(context, lstm_num_units, lstm_num_units) + context)
+		with tf.variable_scope('DNN2_layer'):
+			Warrant0 = tf.nn.relu(add_layer(warrant0, lstm_num_units, lstm_num_units) + warrant0)
+		with tf.variable_scope('DNN2_layer', reuse=True):
+			Warrant1 = tf.nn.relu(add_layer(warrant1, lstm_num_units, lstm_num_units) + warrant1)
+
 		W_m = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1), name='W_m') 
-		self.sim_warrant0 = tf.diag_part(tf.matmul(tf.matmul(context, W_m), tf.transpose(warrant0, [1,0])))
-		self.sim_warrant1 = tf.diag_part(tf.matmul(tf.matmul(context, W_m), tf.transpose(warrant1, [1,0])))
+		self.sim_warrant0 = tf.diag_part(tf.matmul(tf.matmul(Context, W_m), tf.transpose(Warrant0, [1,0])))
+		self.sim_warrant1 = tf.diag_part(tf.matmul(tf.matmul(Context, W_m), tf.transpose(Warrant1, [1,0])))
 		self.prob = tf.nn.softmax(tf.stack([self.sim_warrant0, self.sim_warrant1], axis=1))
 		self.prob_labels = tf.argmax(self.prob, 1)
-		#sort loss
-		#self.loss = tf.reduce_mean(tf.maximum(tf.cast(tf.tile([0], [tf.shape(self.labels)[0]]), dtype=tf.float32),
-		#							1.0 - tf.reduce_sum(tf.multiply(self.labels, self.prob), 1) 
-		#							+ tf.reduce_sum(tf.multiply(1.0-self.labels, self.prob), 1)))
-		#Log Loss
-		#self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.labels, logits=self.prob))
 		#MSE
 		self.loss = tf.reduce_mean(tf.square(self.prob - self.labels))
 		self.acc = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(self.prob, 1), tf.argmax(self.labels, 1)), tf.float32))
@@ -139,14 +145,15 @@ if __name__ == '__main__':
 	lstm_num_units = 256
 	input_keep_prob = 1
 	output_keep_prob = 1
+	keep_prob = 1
 	num_checkpoints = 1	
 	checkpoints_dir = './model/weight/'	
 	
 	#---------Target model-----------
 	n_class = 2
 	batch_size = 64
-	num_epochs = 20
-	evaluate_every = 40
+	num_epochs = 30
+	evaluate_every = 32
 	max_num_undsc = 5
 	
 	#-----------------------Target data--------------------------
@@ -199,7 +206,7 @@ if __name__ == '__main__':
 	
 	with tf.Session(config=config) as sess:
 		global_step = tf.Variable(0, trainable = False, name='global_step')
-		train_op = tf.train.AdamOptimizer(0.0002).minimize(model.loss, global_step = global_step)
+		train_op = tf.train.AdamOptimizer(0.0001).minimize(model.loss, global_step = global_step)
 		saver = tf.train.Saver(max_to_keep=num_checkpoints)
 		sess.run(tf.global_variables_initializer())
 		
@@ -216,6 +223,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:input_keep_prob,
 				model.output_keep_prob:output_keep_prob,
+				model.keep_prob:keep_prob,
 				}
 			_, step, loss, acc = sess.run([train_op, global_step, model.loss, model.acc], feed_dict)	
 			return step, loss, acc
@@ -233,6 +241,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:1,
 				model.output_keep_prob:1,
+				model.keep_prob:1
 				}
 			loss, acc, prob, p_labels = sess.run([model.loss, model.acc, model.prob, model.prob_labels], feed_dict)	
 			return loss, acc, prob, p_labels
@@ -249,6 +258,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:1,
 				model.output_keep_prob:1,
+				model.keep_prob:1
 				}
 			p_labels = sess.run(model.prob_labels, feed_dict)	
 			return p_labels

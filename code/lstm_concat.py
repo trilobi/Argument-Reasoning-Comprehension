@@ -4,6 +4,7 @@ from keras.utils import np_utils
 import numpy as np
 import data_helper
 import pickle
+import batchnorm
 from sklearn.metrics import accuracy_score
 
 #--------------------------------------Model Begin--------------------------------------------------------
@@ -27,6 +28,7 @@ class Model(object):
 		
 		self.input_keep_prob = tf.placeholder(tf.float32, name='rnn_input_keep_prob')
 		self.output_keep_prob = tf.placeholder(tf.float32, name='rnn_output_keep_prob')
+		self.is_training = tf.placeholder(tf.bool)
 		
 		#----------------Target data------------------
 		self.warrant0 = tf.placeholder(tf.int32, [None, max_len], name='warrant0')
@@ -72,60 +74,40 @@ class Model(object):
 			sen_outputs = tf.concat(outputs,2)
 			return sen_outputs
 		
-		def attention(outputs, R_ave, max_len, lstm_num_unit):
-			Wh = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1),
-							name='Wh')
-			Wr = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1),
-							name='Wr')
-			M = tf.nn.tanh(tf.add(self.batch_matmul(outputs, Wh),
-							tf.tile(tf.expand_dims(tf.matmul(R_ave, Wr), 1), (1, max_len, 1))),
-							name='M')
-			w = tf.Variable(tf.truncated_normal([lstm_num_units], stddev=0.1),
-							name='w')
-			alpha = tf.nn.softmax(tf.reduce_sum(tf.multiply(M, w), axis=2),
-							name='alpha')
-			R_att = tf.squeeze(tf.matmul(tf.expand_dims(alpha, 1), outputs), squeeze_dims=[1],
-							name='R_att')
-			Wp = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1),
-							name='Wp')
-			Wx = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1),
-							name='Wx')
-			atten_lstm_output = tf.nn.tanh(tf.matmul(R_att, Wp) + tf.matmul(R_ave, Wx),
-							name='atten_lstm_output')
-			return atten_lstm_output
-						
 		with tf.variable_scope('lstm1_layer'):
 			reason_outputs = lstm_layer(reason_embedded, self.reason_len)
 		with tf.variable_scope('lstm1_layer', reuse=True):
 			claim_outputs = lstm_layer(claim_embedded, self.claim_len)
-			claim_last_outputs = self.get_last(claim_outputs, self.claim_len)
-		
-		claim_meanpooling = tf.reduce_mean(claim_outputs, 1)
-		claim_maxpooling = tf.reduce_max(claim_outputs, 1)
-		alpha = tf.nn.softmax(tf.transpose(tf.matmul(reason_outputs, 
-										   tf.expand_dims(claim_maxpooling, -1)), [0,2,1]))
-		#context = tf.reduce_mean(tf.matmul(alpha, reason_outputs), 1)
-		
-		context = attention(reason_outputs, claim_maxpooling, max_len, lstm_num_units)
-
-		with tf.variable_scope('lstm2_layer'):
+		with tf.variable_scope('lstm1_layer', reuse=True):
 			warrant0_outputs = lstm_layer(warrant0_embedded, self.warrant0_len)
-			warrant0 = tf.reduce_max(warrant0_outputs, 1)
-			#warrant0 = self.get_last(warrant0_outputs, self.warrant0_len)
-		with tf.variable_scope('lstm2_layer', reuse=True):
+		with tf.variable_scope('lstm1_layer', reuse=True):
 			warrant1_outputs = lstm_layer(warrant1_embedded, self.warrant1_len)
-			warrant1 = tf.reduce_max(warrant1_outputs, 1)
-			#warrant1 = self.get_last(warrant1_outputs, self.warrant1_len)
+	
+		claim_maxpooling = tf.reduce_max(claim_outputs, 1)
+		alpha = tf.nn.softmax(tf.transpose(tf.matmul(reason_outputs,
+								tf.expand_dims(claim_maxpooling, -1)), [0,2,1]))
+		context = tf.reduce_mean(tf.matmul(alpha, reason_outputs), 1)
+		warrant0 = tf.reduce_max(warrant0_outputs, 1)
+		warrant1 = tf.reduce_max(warrant1_outputs, 1)
+			
+		def add_layer(inputs, in_size, out_size, activation_function=None):
+			W = tf.Variable(tf.truncated_normal((in_size, out_size), stddev=0.1))
+			b = tf.Variable(tf.constant(0.1, shape=[out_size]))
+			out = tf.nn.xw_plus_b(inputs, W, b)
+			if activation_function is None:
+				outputs = out
+			else:
+				outputs = activation_function(out)
+			return outputs
 		
-		W_m = tf.Variable(tf.truncated_normal([lstm_num_units, lstm_num_units], stddev=0.1), name='W_m') 
-		self.sim_warrant0 = tf.diag_part(tf.matmul(tf.matmul(context, W_m), tf.transpose(warrant0, [1,0])))
-		self.sim_warrant1 = tf.diag_part(tf.matmul(tf.matmul(context, W_m), tf.transpose(warrant1, [1,0])))
-		self.prob = tf.nn.softmax(tf.stack([self.sim_warrant0, self.sim_warrant1], axis=1))
+		context_0 = tf.concat([context, warrant0], axis=-1)
+		context_1 = tf.concat([context, warrant1], axis=-1)
+		
+		W_m = tf.Variable(tf.truncated_normal([2*lstm_num_units, 1], stddev=0.1), name='W_m')
+		S_0 = tf.matmul(context_0, W_m)
+		S_1 = tf.matmul(context_1, W_m)
+		self.prob = tf.nn.softmax(tf.concat([S_0, S_1], axis=-1))
 		self.prob_labels = tf.argmax(self.prob, 1)
-		#sort loss
-		#self.loss = tf.reduce_mean(tf.maximum(tf.cast(tf.tile([0], [tf.shape(self.labels)[0]]), dtype=tf.float32),
-		#							1.0 - tf.reduce_sum(tf.multiply(self.labels, self.prob), 1) 
-		#							+ tf.reduce_sum(tf.multiply(1.0-self.labels, self.prob), 1)))
 		#Log Loss
 		#self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.labels, logits=self.prob))
 		#MSE
@@ -137,8 +119,8 @@ if __name__ == '__main__':
 	
 	max_len = 25
 	lstm_num_units = 256
-	input_keep_prob = 1
-	output_keep_prob = 1
+	input_keep_prob = 0.8
+	output_keep_prob = 0.8
 	num_checkpoints = 1	
 	checkpoints_dir = './model/weight/'	
 	
@@ -146,8 +128,8 @@ if __name__ == '__main__':
 	n_class = 2
 	batch_size = 64
 	num_epochs = 20
-	evaluate_every = 40
-	max_num_undsc = 5
+	evaluate_every = 40 
+	max_num_undsc = 10
 	
 	#-----------------------Target data--------------------------
 	print 'load target data.......'
@@ -199,7 +181,8 @@ if __name__ == '__main__':
 	
 	with tf.Session(config=config) as sess:
 		global_step = tf.Variable(0, trainable = False, name='global_step')
-		train_op = tf.train.AdamOptimizer(0.0002).minimize(model.loss, global_step = global_step)
+		learning_rate = tf.train.exponential_decay(0.002, global_step, decay_steps=len(train_labels)/batch_size, decay_rate=0.9)
+		train_op = tf.train.AdamOptimizer(learning_rate).minimize(model.loss, global_step = global_step)
 		saver = tf.train.Saver(max_to_keep=num_checkpoints)
 		sess.run(tf.global_variables_initializer())
 		
@@ -216,6 +199,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:input_keep_prob,
 				model.output_keep_prob:output_keep_prob,
+				model.is_training:True,
 				}
 			_, step, loss, acc = sess.run([train_op, global_step, model.loss, model.acc], feed_dict)	
 			return step, loss, acc
@@ -233,6 +217,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:1,
 				model.output_keep_prob:1,
+				model.is_training:False,
 				}
 			loss, acc, prob, p_labels = sess.run([model.loss, model.acc, model.prob, model.prob_labels], feed_dict)	
 			return loss, acc, prob, p_labels
@@ -249,6 +234,7 @@ if __name__ == '__main__':
 				model.claim_len:claim_len,
 				model.input_keep_prob:1,
 				model.output_keep_prob:1,
+				model.is_training:False,
 				}
 			p_labels = sess.run(model.prob_labels, feed_dict)	
 			return p_labels
@@ -284,6 +270,7 @@ if __name__ == '__main__':
 											   dev_reason_len,
 											   dev_claim_len)
 				print "Dev Loss : %g, Dev Acc : %g" %(dev_loss, dev_acc)
+		
 				test_labels = test_step(test_warrant0,
 			    		   			   test_warrant1,
 									   test_reason,
@@ -295,7 +282,7 @@ if __name__ == '__main__':
 				print '**************save it save it ************* '
 				acc = accuracy_score(test_labels, gold)
 				print acc
-		'''
+			'''		
 				if dev_acc >= max_dev_acc:
 					max_dev_acc = dev_acc
 					min_dev_loss = dev_loss
@@ -315,4 +302,4 @@ if __name__ == '__main__':
 					num_undesc += 1
 				print '-------------------------'
 		print "TestAcc: %g, MinDevAcc: %g" %(acc, max_dev_acc)
-		'''
+		'''	

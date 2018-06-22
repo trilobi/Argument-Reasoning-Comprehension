@@ -19,11 +19,11 @@ def iter_batch(batch_size, num_epochs, *args):
 			data_batch = []
 			for i in range(len(args)):
 				try:
-					x = np.vstack((part1[i], part2[i])) 
-				except:
 					x = np.concatenate((part1[i], part2[i]))
+				except:
+					x = np.vstack((part1[i], part2[i]))
 				data_batch.append(x)
-			yield current_epoch, data_batch
+			yield  current_epoch, data_batch
 		if current_idx + batch_size < data_size:
 			current_idx += batch_size
 		else:
